@@ -68,29 +68,102 @@ jobs:
           # Split by pipe into an array
           IFS='|' read -ra URL_LIST <<< "$RAW_URLS"
 
-          FILENAMES=()
+          # Filter out blank entries to get a real count
+          VALID_URLS=()
+          for u in "${URL_LIST[@]}"; do
+            u=$(echo "$u" | xargs)
+            [[ -n "$u" ]] && VALID_URLS+=("$u")
+          done
+          TOTAL_FILES=${#VALID_URLS[@]}
 
-          for FILE_URL in "${URL_LIST[@]}"; do
-            # Trim whitespace
-            FILE_URL=$(echo "$FILE_URL" | xargs)
-            [[ -z "$FILE_URL" ]] && continue
+          FILENAMES=()
+          FILE_INDEX=0
+
+          # ── helper: download one URL with a live size progress ticker ──
+          download_with_progress() {
+            local FILE_URL="$1"
+            local DEST="$2"
+            local LABEL="$3"   # e.g. "(1/3) Downloading: foo.zip"
+
+            # Try HEAD request to learn total size (some servers don't support it)
+            local TOTAL_BYTES
+            TOTAL_BYTES=$(curl -sI --max-time 10 -L "$FILE_URL" \
+              | grep -i '^content-length:' \
+              | tail -1 \
+              | awk '{print $2}' \
+              | tr -d '\r')
+
+            if [[ "$TOTAL_BYTES" =~ ^[0-9]+$ ]] && [[ "$TOTAL_BYTES" -gt 0 ]]; then
+              local TOTAL_MB=$(( TOTAL_BYTES / 1024 / 1024 ))
+            else
+              local TOTAL_MB=""   # unknown size
+            fi
+
+            # Start download in background (suppress curl's own output)
+            curl -L --fail --retry 3 --silent \
+              -o "$DEST" "$FILE_URL" &
+            local CURL_PID=$!
+
+            local DOTS=""
+            local LAST_MB=-1
+
+            # Poll every 3 s while curl is running
+            while kill -0 "$CURL_PID" 2>/dev/null; do
+              sleep 3
+              DOTS="${DOTS}."
+
+              local CURRENT_BYTES
+              CURRENT_BYTES=$(stat -c%s "$DEST" 2>/dev/null || echo 0)
+              local CURRENT_MB=$(( CURRENT_BYTES / 1024 / 1024 ))
+
+              # Only print when progress actually moved (avoids duplicate lines)
+              if [[ "$CURRENT_MB" -ne "$LAST_MB" ]]; then
+                if [[ -n "$TOTAL_MB" ]]; then
+                  echo "${LABEL} : (${CURRENT_MB} MB / ${TOTAL_MB} MB) ${DOTS}"
+                else
+                  echo "${LABEL} : (${CURRENT_MB} MB downloaded) ${DOTS}"
+                fi
+                LAST_MB=$CURRENT_MB
+              fi
+            done
+
+            # Capture curl exit code
+            wait "$CURL_PID"
+            local EXIT_CODE=$?
+
+            if [[ "$EXIT_CODE" -ne 0 ]]; then
+              echo "ERROR: curl failed with exit code $EXIT_CODE for $FILE_URL"
+              return $EXIT_CODE
+            fi
+
+            local FINAL_BYTES
+            FINAL_BYTES=$(stat -c%s "$DEST" 2>/dev/null || echo 0)
+            echo "${LABEL} : Done ($(( FINAL_BYTES / 1024 / 1024 )) MB total) ✓"
+          }
+          # ── end helper ──
+
+          for FILE_URL in "${VALID_URLS[@]}"; do
+            FILE_INDEX=$(( FILE_INDEX + 1 ))
 
             FILENAME=$(basename "$FILE_URL" | cut -d'?' -f1)
             FILENAME=$(echo "$FILENAME" | sed 's/[^a-zA-Z0-9._() -]/_/g')
 
-            echo "Downloading: $FILENAME  ←  $FILE_URL"
+            LABEL="(${FILE_INDEX}/${TOTAL_FILES}) Downloading: ${FILENAME}"
+            echo "──────────────────────────────────────"
+            echo "URL: ${FILE_URL}"
 
-            curl -L --fail --retry 3 \
-              -o "temp_dl/$FILENAME" \
-              "$FILE_URL"
+            download_with_progress "$FILE_URL" "temp_dl/$FILENAME" "$LABEL"
 
             FILENAMES+=("$FILENAME")
           done
 
+          echo "══════════════════════════════════════"
+          echo "All ${TOTAL_FILES} file(s) downloaded."
+
           # Join filenames with comma for the output
           JOINED=$(IFS=','; echo "${FILENAMES[*]}")
           echo "filenames=$JOINED" >> "$GITHUB_OUTPUT"
-          echo "count=${#FILENAMES[@]}"  >> "$GITHUB_OUTPUT"
+          echo "count=${#FILENAMES[@]}" >> "$GITHUB_OUTPUT"
 
       - name: Create Split Archives
         id: archive
