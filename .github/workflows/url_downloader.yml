@@ -103,6 +103,8 @@ jobs:
             THRESH_MB=1800
           fi
 
+          THRESH_BYTES=$(( THRESH_MB * 1024 * 1024 ))
+
           cd temp_dl || exit 1
 
           for BASENAME in *; do
@@ -110,9 +112,16 @@ jobs:
             [[ "$BASENAME" == *.7z* ]] && continue
             [[ ! -f "$BASENAME" ]] && continue
 
+            FILE_SIZE=$(stat -c%s "$BASENAME")
+
+            if [[ "$FILE_SIZE" -le "$THRESH_BYTES" ]]; then
+              echo "Skipping archive for: $BASENAME ($(( FILE_SIZE / 1024 / 1024 )) MB ≤ ${THRESH_MB} MB threshold — keeping original)"
+              continue
+            fi
+
             ARCHIVE_BASE="${BASENAME%.*}_$(date +%Y%m%d_%H%M%S)"
 
-            echo "Archiving: $BASENAME  →  ${ARCHIVE_BASE}.7z"
+            echo "Archiving: $BASENAME ($(( FILE_SIZE / 1024 / 1024 )) MB > ${THRESH_MB} MB threshold)  →  ${ARCHIVE_BASE}.7z"
 
             if [ -n "$PASS" ]; then
               7z a -p"$PASS" -mhe=on -mx=3 -v${THRESH_MB}m "${ARCHIVE_BASE}.7z" "$BASENAME"
@@ -125,7 +134,7 @@ jobs:
               mv "${ARCHIVE_BASE}.7z.001" "${ARCHIVE_BASE}.7z"
             fi
 
-            # Remove original after archiving
+            # Remove original only after successful archiving
             rm -f "$BASENAME"
           done
 
