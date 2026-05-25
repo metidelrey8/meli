@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       file_url:
-        description: "Direct File URL"
+        description: "Direct File URL(s) — separate multiple URLs with |"
         required: true
         type: string
 
@@ -57,31 +57,45 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y p7zip-full curl
 
-      - name: Download File
+      - name: Download Files
         id: download
         shell: bash
         run: |
           mkdir -p temp_dl
 
-          FILE_URL="${{ github.event.inputs.file_url }}"
+          RAW_URLS="${{ github.event.inputs.file_url }}"
 
-          FILENAME=$(basename "$FILE_URL" | cut -d'?' -f1)
-          FILENAME=$(echo "$FILENAME" | sed 's/[^a-zA-Z0-9._() -]/_/g')
+          # Split by pipe into an array
+          IFS='|' read -ra URL_LIST <<< "$RAW_URLS"
 
-          echo "Downloading: $FILENAME"
+          FILENAMES=()
 
-          curl -L --fail --retry 3 \
-            -o "temp_dl/$FILENAME" \
-            "$FILE_URL"
+          for FILE_URL in "${URL_LIST[@]}"; do
+            # Trim whitespace
+            FILE_URL=$(echo "$FILE_URL" | xargs)
+            [[ -z "$FILE_URL" ]] && continue
 
-          echo "filename=$FILENAME" >> "$GITHUB_OUTPUT"
-          echo "filepath=temp_dl/$FILENAME" >> "$GITHUB_OUTPUT"
+            FILENAME=$(basename "$FILE_URL" | cut -d'?' -f1)
+            FILENAME=$(echo "$FILENAME" | sed 's/[^a-zA-Z0-9._() -]/_/g')
 
-      - name: Create Split Archive
+            echo "Downloading: $FILENAME  ←  $FILE_URL"
+
+            curl -L --fail --retry 3 \
+              -o "temp_dl/$FILENAME" \
+              "$FILE_URL"
+
+            FILENAMES+=("$FILENAME")
+          done
+
+          # Join filenames with comma for the output
+          JOINED=$(IFS=','; echo "${FILENAMES[*]}")
+          echo "filenames=$JOINED" >> "$GITHUB_OUTPUT"
+          echo "count=${#FILENAMES[@]}"  >> "$GITHUB_OUTPUT"
+
+      - name: Create Split Archives
         id: archive
         shell: bash
         run: |
-          FILEPATH="${{ steps.download.outputs.filepath }}"
           PASS="${{ github.event.inputs.zip_password }}"
           THRESH_MB="${{ github.event.inputs.max_part_mb }}"
 
@@ -89,23 +103,31 @@ jobs:
             THRESH_MB=1800
           fi
 
-          BASENAME=$(basename "$FILEPATH")
-
           cd temp_dl || exit 1
 
-          ARCHIVE_BASE="${BASENAME%.*}_$(date +%Y%m%d_%H%M%S)"
+          for BASENAME in *; do
+            # Skip already-created archives to avoid re-compressing
+            [[ "$BASENAME" == *.7z* ]] && continue
+            [[ ! -f "$BASENAME" ]] && continue
 
-          if [ -n "$PASS" ]; then
-            7z a -p"$PASS" -mhe=on -mx=3 -v${THRESH_MB}m "${ARCHIVE_BASE}.7z" "$BASENAME"
-          else
-            7z a -mx=3 -v${THRESH_MB}m "${ARCHIVE_BASE}.7z" "$BASENAME"
-          fi
+            ARCHIVE_BASE="${BASENAME%.*}_$(date +%Y%m%d_%H%M%S)"
 
-          if [ -f "${ARCHIVE_BASE}.7z.001" ] && [ ! -f "${ARCHIVE_BASE}.7z.002" ]; then
-            mv "${ARCHIVE_BASE}.7z.001" "${ARCHIVE_BASE}.7z"
-          fi
+            echo "Archiving: $BASENAME  →  ${ARCHIVE_BASE}.7z"
 
-          echo "archive_name=${ARCHIVE_BASE}.7z" >> "$GITHUB_OUTPUT"
+            if [ -n "$PASS" ]; then
+              7z a -p"$PASS" -mhe=on -mx=3 -v${THRESH_MB}m "${ARCHIVE_BASE}.7z" "$BASENAME"
+            else
+              7z a -mx=3 -v${THRESH_MB}m "${ARCHIVE_BASE}.7z" "$BASENAME"
+            fi
+
+            # If only one part was created, strip the .001 suffix
+            if [ -f "${ARCHIVE_BASE}.7z.001" ] && [ ! -f "${ARCHIVE_BASE}.7z.002" ]; then
+              mv "${ARCHIVE_BASE}.7z.001" "${ARCHIVE_BASE}.7z"
+            fi
+
+            # Remove original after archiving
+            rm -f "$BASENAME"
+          done
 
           cd ..
 
@@ -128,7 +150,7 @@ jobs:
 
           git add downloads/
 
-          git commit -m "Direct Download: ${{ steps.download.outputs.filename }} [skip ci]" || echo "Nothing to commit"
+          git commit -m "Direct Download: ${{ steps.download.outputs.count }} file(s) [skip ci]" || echo "Nothing to commit"
 
           git push
 
@@ -141,7 +163,8 @@ jobs:
           body: |
             Direct download completed.
 
-            File: ${{ steps.download.outputs.filename }}
+            Files: ${{ steps.download.outputs.filenames }}
+            Count: ${{ steps.download.outputs.count }}
             Date: ${{ steps.get_date.outputs.date }}
           files: temp_dl/*
 
